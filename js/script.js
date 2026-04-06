@@ -24,6 +24,61 @@ let currentApodItems = [];
 const apodCache = new Map();
 let activeRequestController = null;
 
+// Local fallback images for times when the NASA API is temporarily unavailable.
+function getFallbackApodItems() {
+	return [
+		{
+			title: 'Andromeda Galaxy (Sample)',
+			date: 'Sample Image',
+			url: 'https://apod.nasa.gov/apod/image/2201/AndromedaMosaic1312.jpg',
+			hdurl: 'https://apod.nasa.gov/apod/image/2201/AndromedaMosaic1312.jpg',
+			explanation: 'NASA APOD is temporarily unavailable, so this sample space photo is shown instead.'
+		},
+		{
+			title: 'Pillars of Creation (Sample)',
+			date: 'Sample Image',
+			url: 'https://apod.nasa.gov/apod/image/2210/pillars-creation_jwst_960.jpg',
+			hdurl: 'https://apod.nasa.gov/apod/image/2210/pillars-creation_jwst_960.jpg',
+			explanation: 'This is a fallback photo so the gallery still works in class during API downtime.'
+		},
+		{
+			title: 'Earth and Moon from Mars (Sample)',
+			date: 'Sample Image',
+			url: 'https://apod.nasa.gov/apod/image/1402/CuriosityEarthMoon1024.jpg',
+			hdurl: 'https://apod.nasa.gov/apod/image/1402/CuriosityEarthMoon1024.jpg',
+			explanation: 'Try again later to load live APOD data from NASA.'
+		}
+	];
+}
+
+// Retry once for temporary server problems so students do not see random failures.
+async function fetchWithRetry(url, signal) {
+	const maxAttempts = 2;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		try {
+			const response = await fetch(url, { signal });
+			const isTemporaryServerError = [502, 503, 504].includes(response.status);
+
+			if (isTemporaryServerError && attempt < maxAttempts) {
+				await new Promise((resolve) => setTimeout(resolve, 1200));
+				continue;
+			}
+
+			return response;
+		} catch (error) {
+			const isNetworkFetchError = error.name === 'TypeError';
+
+			if (isNetworkFetchError && attempt < maxAttempts) {
+				await new Promise((resolve) => setTimeout(resolve, 1200));
+				continue;
+			}
+
+			throw error;
+		}
+	}
+}
+
 // Call the setupDateInputs function from dateRange.js
 // This sets up the date pickers to:
 // - Default to a range of 9 days (from 9 days ago to today)
@@ -44,11 +99,13 @@ function showGalleryMessage(message, icon = '🔭') {
 function createGalleryItem(apodItem, index) {
 	const loadingMode = index === 0 ? 'eager' : 'lazy';
 	const fetchPriority = index === 0 ? 'high' : 'low';
+	const isVideo = apodItem.media_type === 'video';
+	const mediaLabel = isVideo ? 'Video' : 'Image';
 
 	return `
 		<article class="gallery-item" data-index="${index}">
 			<img
-				src="${apodItem.url}"
+				src="${isVideo ? apodItem.thumbnail_url : apodItem.url}"
 				alt="${apodItem.title}"
 				loading="${loadingMode}"
 				decoding="async"
@@ -56,6 +113,7 @@ function createGalleryItem(apodItem, index) {
 			/>
 			<p><strong>${apodItem.title}</strong></p>
 			<p>${apodItem.date}</p>
+			<p>${mediaLabel}</p>
 		</article>
 	`;
 }
@@ -103,15 +161,25 @@ async function getApodByDateRange(startDate, endDate, signal) {
 	let lastErrorMessage = 'Could not load space images. Please try again.';
 
 	for (const apiKey of keysToTry) {
-		const url = `${APOD_API_URL}?api_key=${apiKey}&start_date=${startDate}&end_date=${endDate}`;
-		response = await fetch(url, { signal });
+		// thumbs=true lets the API include thumbnail_url for video entries.
+		const url = `${APOD_API_URL}?api_key=${apiKey}&start_date=${startDate}&end_date=${endDate}&thumbs=true`;
+		response = await fetchWithRetry(url, signal);
 
 		let parsedData = null;
+		let responseText = '';
 
 		try {
-			parsedData = await response.json();
+			responseText = await response.text();
 		} catch {
-			parsedData = null;
+			responseText = '';
+		}
+
+		if (responseText) {
+			try {
+				parsedData = JSON.parse(responseText);
+			} catch {
+				parsedData = null;
+			}
 		}
 
 		if (response.ok) {
@@ -119,13 +187,19 @@ async function getApodByDateRange(startDate, endDate, signal) {
 			break;
 		}
 
-		const nasaMessage = parsedData?.error?.message;
+		const nasaMessage = parsedData?.error?.message || parsedData?.msg || parsedData?.message;
 
 		if (nasaMessage) {
-			lastErrorMessage = nasaMessage;
+			lastErrorMessage = `NASA API error (${response.status}): ${nasaMessage}`;
+		} else if (responseText) {
+			lastErrorMessage = `NASA API error (${response.status}): ${responseText.slice(0, 160)}`;
+		} else {
+			lastErrorMessage = `NASA API error (${response.status}).`;
 		}
 
-		if (!nasaMessage || !nasaMessage.toLowerCase().includes('api key')) {
+		const mentionsApiKey = lastErrorMessage.toLowerCase().includes('api key') || lastErrorMessage.toLowerCase().includes('api_key');
+
+		if (!mentionsApiKey) {
 			break;
 		}
 	}
@@ -135,15 +209,15 @@ async function getApodByDateRange(startDate, endDate, signal) {
 	}
 
 	// APOD can return a single object for a one-day request.
-	const apodItems = Array.isArray(responseData) ? responseData : [responseData];
+	const apodItems = Array.isArray(responseData) ? responseData : [responseData].filter(Boolean);
 
-	// We only show images in this gallery (APOD can also return videos)
-	const imageItems = apodItems
-		.filter((item) => item.media_type === 'image')
+	// Show images and videos (videos use thumbnail_url from thumbs=true).
+	const galleryItems = apodItems
+		.filter((item) => item.media_type === 'image' || (item.media_type === 'video' && item.thumbnail_url))
 		.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-	apodCache.set(cacheKey, imageItems);
-	return imageItems;
+	apodCache.set(cacheKey, galleryItems);
+	return galleryItems;
 }
 
 // Handle the button click to fetch and display APOD results
@@ -176,7 +250,7 @@ async function handleGetImagesClick() {
 		const apodItems = await getApodByDateRange(startDate, endDate, activeRequestController.signal);
 
 		if (apodItems.length === 0) {
-			showGalleryMessage('No images found in this date range. Try different dates.');
+			showGalleryMessage('No APOD entries found in this date range. Try different dates.');
 			return;
 		}
 
@@ -186,8 +260,15 @@ async function handleGetImagesClick() {
 			return;
 		}
 
-		if (error.name === 'TypeError' && error.message.toLowerCase().includes('fetch')) {
-			showGalleryMessage('Network error: unable to reach NASA API. Check your internet connection and try again.', '📡');
+		const isNetworkFetchError = error.name === 'TypeError' && error.message.toLowerCase().includes('fetch');
+		const isNasaServerOutage = /NASA API error \((5\d\d)\)/.test(error.message);
+
+		if (isNetworkFetchError || isNasaServerOutage) {
+			renderGallery(getFallbackApodItems());
+			getImagesButton.textContent = 'Showing Sample Photos';
+			setTimeout(() => {
+				getImagesButton.textContent = 'Get Space Images';
+			}, 1800);
 			return;
 		}
 
@@ -213,6 +294,11 @@ gallery.addEventListener('click', (event) => {
 	const selectedItem = currentApodItems[itemIndex];
 
 	if (!selectedItem) {
+		return;
+	}
+
+	if (selectedItem.media_type === 'video') {
+		window.open(selectedItem.url, '_blank', 'noopener,noreferrer');
 		return;
 	}
 
